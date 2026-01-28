@@ -523,6 +523,151 @@ fn simple_eval_(
                 };
                 values.insert(node.output[0].clone(), ys);
             }
+            "ScatterElements" => {
+                let data = get(&node.input[0])?;
+                let indices = get(&node.input[1])?;
+                let updates = get(&node.input[2])?;
+                let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(0);
+                let reduction = get_attr_opt::<str>(node, "reduction")?.unwrap_or("none");
+
+                let dims = data.dims();
+                let axis = if axis < 0 {
+                    (dims.len() as i64 + axis) as usize
+                } else {
+                    axis as usize
+                };
+
+                let output = match reduction {
+                    "none" => data.scatter(indices, updates, axis)?,
+                    "add" => data.scatter_add(indices, updates, axis)?,
+                    _ => bail!("unsupported reduction {reduction} for ScatterElements"),
+                };
+                values.insert(node.output[0].clone(), output);
+            }
+            "GatherND" => {
+                let data = get(&node.input[0])?;
+                let indices = get(&node.input[1])?;
+                let batch_dims = get_attr_opt::<i64>(node, "batch_dims")?.copied().unwrap_or(0) as usize;
+
+                if batch_dims != 0 {
+                    bail!("GatherND with batch_dims != 0 is not supported yet");
+                }
+
+                let data_dims = data.dims();
+                let indices_dims = indices.dims();
+                let k = *indices_dims.last().unwrap();
+                let num_indices = indices_dims[..indices_dims.len() - 1].iter().product::<usize>();
+
+                let indices_flat = indices.reshape((num_indices, k))?.to_vec2::<i64>()?;
+                
+                // Calculate flat indices
+                let mut strides = vec![1usize; k];
+                for i in (0..k-1).rev() {
+                    strides[i] = strides[i+1] * data_dims[i+1];
+                }
+                
+                let mut flat_indices = Vec::with_capacity(num_indices);
+                for idx in indices_flat {
+                    let mut flat_idx = 0usize;
+                    for (i, &v) in idx.iter().enumerate() {
+                        let v = if v < 0 { (data_dims[i] as i64 + v) as usize } else { v as usize };
+                        flat_idx += v * strides[i];
+                    }
+                    flat_indices.push(flat_idx as u32);
+                }
+
+                let flat_indices_tensor = Tensor::new(flat_indices, data.device())?;
+                
+                // Flatten data's indexed dimensions
+                let slice_size: usize = data_dims[k..].iter().product();
+                let data_reshaped = data.reshape((data_dims[..k].iter().product::<usize>(), slice_size))?;
+                
+                let gathered = data_reshaped.index_select(&flat_indices_tensor, 0)?;
+                
+                // Reshape to final shape
+                let mut final_shape = indices_dims[..indices_dims.len()-1].to_vec();
+                final_shape.extend(&data_dims[k..]);
+                let output = gathered.reshape(final_shape)?;
+                
+                values.insert(node.output[0].clone(), output);
+            }
+            "InstanceNormalization" => {
+                let epsilon = get_attr_opt::<f32>(node, "epsilon")?
+                    .copied()
+                    .unwrap_or(1e-5);
+                let x = get(&node.input[0])?;
+                let scale = get(&node.input[1])?;
+                let b = get(&node.input[2])?;
+
+                let dims = x.dims();
+                if dims.len() < 2 {
+                    bail!(
+                        "InstanceNormalization expects at least 2 dimensions: {:?}",
+                        dims
+                    );
+                }
+
+                let n = dims[0];
+                let c = dims[1];
+                let rest_size: usize = dims[2..].iter().product();
+
+                // Reshape to (N, C, Rest)
+                let x_reshaped = x.reshape((n, c, rest_size))?;
+
+                // Mean along rest_size
+                let mean = x_reshaped.mean_keepdim(2)?;
+
+                // x - mean
+                let x_centered = x_reshaped.broadcast_sub(&mean)?;
+
+                // Variance
+                let var = x_centered.sqr()?.mean_keepdim(2)?;
+
+                // Normalize
+                let x_norm = x_centered.broadcast_div(&(var + epsilon as f64)?.sqrt()?)?;
+
+                // Apply scale and bias
+                // scale and b are (C,)
+                let target_shape = vec![1, c, 1];
+                let scale = scale.reshape(target_shape.clone())?;
+                let b = b.reshape(target_shape)?;
+
+                let y = x_norm.broadcast_mul(&scale)?.broadcast_add(&b)?;
+
+                // Reshape back to original
+                let y = y.reshape(dims)?;
+                values.insert(node.output[0].clone(), y);
+            }
+            "LayerNormalization" => {
+                let x = get(&node.input[0])?;
+                let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(-1);
+                let epsilon = get_attr_opt::<f32>(node, "epsilon")?
+                    .copied()
+                    .unwrap_or(1e-5);
+
+                let dims = x.dims();
+                let axis = if axis < 0 {
+                    (dims.len() as i64 + axis) as usize
+                } else {
+                    axis as usize
+                };
+
+                let mean = x.mean_keepdim(axis)?;
+                let centered = x.broadcast_sub(&mean)?;
+                let var = centered.sqr()?.mean_keepdim(axis)?;
+                let inv_std = (var + epsilon as f64)?.sqrt()?.recip()?;
+                let mut y = centered.broadcast_mul(&inv_std)?;
+
+                if node.input.len() > 1 {
+                    let scale = get(&node.input[1])?;
+                    y = y.broadcast_mul(scale)?;
+                }
+                if node.input.len() > 2 {
+                    let bias = get(&node.input[2])?;
+                    y = y.broadcast_add(bias)?;
+                }
+                values.insert(node.output[0].clone(), y);
+            }
             "BatchNormalization" => {
                 let training_mode = get_attr_opt::<i64>(node, "training_mode")?;
                 if training_mode.copied().unwrap_or(0) != 0 {
@@ -1172,25 +1317,35 @@ fn simple_eval_(
             "Pad" => {
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
-                let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
-                    bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
-                        node.input.len(),
-                        node.name
-                    );
-                }
-                if pads.rank() != 1 {
-                    bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
-                }
-                if pads.dim(0).unwrap() != 2 * data.rank() {
-                    bail!("Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}", pads, data.rank());
+                
+                let pads = if node.input.len() > 1 && !node.input[1].is_empty() {
+                    get(&node.input[1])?.to_vec1::<i64>()?
+                } else {
+                    match get_attr_opt::<[i64]>(node, "pads")? {
+                        Some(p) => p.to_vec(),
+                        None => bail!("Pad node missing 'pads' input and attribute"),
+                    }
+                };
+
+                if pads.len() != 2 * data.rank() {
+                    bail!("Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}", pads.len(), data.rank());
                 }
 
-                let pads = pads.to_vec1::<i64>()?;
                 let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
 
                 match mode {
+                    "constant" => {
+                        let mut out = data.clone();
+                        for (i, (&pre, &post)) in pads_pre.iter().zip(pads_post.iter()).enumerate() {
+                            let pre: i64 = pre;
+                            let post: i64 = post;
+                            if pre == 0 && post == 0 {
+                                continue;
+                            }
+                            out = out.pad_with_zeros(i, pre as usize, post as usize)?;
+                        }
+                        values.insert(node.output[0].clone(), out);
+                    }
                     "reflect" => {
                         let mut out = data.clone();
                         for (i, &dim) in data.dims().iter().enumerate().rev() {
@@ -1701,6 +1856,120 @@ fn simple_eval_(
                     Tensor::randn(mean, scale, shape, &Device::Cpu)?.to_dtype(dtype)?
                 };
                 values.insert(node.output[0].clone(), output);
+            }
+            random_type @ ("RandomUniformLike" | "RandomNormalLike") => {
+                let input = get(&node.input[0])?;
+                let dt: i64 = get_attr_opt(node, "dtype")?.copied().unwrap_or(1); // 1 is float
+                                                                                  // type by
+                                                                                  // default
+                let dtype = match DataType::try_from(dt as i32) {
+                    Ok(dt) => match dtype(dt) {
+                        Some(DType::U8 | DType::U32 | DType::I64) => {
+                            bail!(
+                                "unsupported 'dtype' value {dt:?}, only floats are allowed, for {random_type} {}",
+                                node.name
+                            )
+                        }
+                        Some(dt) => dt,
+                        None => {
+                            bail!(
+                                "unsupported 'dtype' value {dt:?} for {random_type} {}",
+                                node.name
+                            )
+                        }
+                    },
+                    Err(_) => {
+                        bail!(
+                            "unsupported 'dtype' value {dt:?} for {random_type} {}",
+                            node.name
+                        )
+                    }
+                };
+                let seed: Option<f32> = get_attr_opt(node, "seed")?.copied();
+                if seed.is_some() {
+                    bail!("seed for {random_type} is currently not supported")
+                };
+                let output = if random_type == "RandomUniformLike" {
+                    let low: f32 = get_attr_opt(node, "low")?.copied().unwrap_or(0.0);
+                    let high: f32 = get_attr_opt(node, "high")?.copied().unwrap_or(1.0);
+                    Tensor::rand(low, high, input.shape(), input.device())?.to_dtype(dtype)?
+                } else {
+                    let mean: f32 = get_attr_opt(node, "mean")?.copied().unwrap_or(0.0);
+                    let scale: f32 = get_attr_opt(node, "scale")?.copied().unwrap_or(1.0);
+                    Tensor::randn(mean, scale, input.shape(), input.device())?.to_dtype(dtype)?
+                };
+                values.insert(node.output[0].clone(), output);
+            }
+            "ConvTranspose" => {
+                let xs = get(&node.input[0])?;
+                let ws = get(&node.input[1])?;
+                let pads = get_attr_opt::<[i64]>(node, "pads")?;
+                let strides = get_attr_opt::<[i64]>(node, "strides")?;
+                let output_padding = get_attr_opt::<[i64]>(node, "output_padding")?;
+                let dilations = get_attr_opt::<[i64]>(node, "dilations")?;
+                let _groups = get_attr_opt::<i64>(node, "group")?.copied().unwrap_or(1);
+
+                let padding = match pads {
+                    None => 0,
+                    Some([p1, p2, p3, p4]) => {
+                        if p1 != p2 || p1 != p3 || p1 != p4 {
+                            bail!("asymmetric padding for ConvTranspose2d is not supported yet")
+                        }
+                        *p1 as usize
+                    }
+                    Some([p1, p2]) => {
+                        if p1 != p2 {
+                            bail!("asymmetric padding for ConvTranspose2d is not supported yet")
+                        }
+                        *p1 as usize
+                    }
+                    _ => bail!("unsupported pads for ConvTranspose2d"),
+                };
+                let stride = match strides {
+                    None => 1,
+                    Some([s1, s2]) => {
+                        if s1 != s2 {
+                            bail!("asymmetric strides for ConvTranspose2d is not supported yet")
+                        }
+                        *s1 as usize
+                    }
+                    _ => bail!("unsupported strides for ConvTranspose2d"),
+                };
+                let out_padding = match output_padding {
+                    None => 0,
+                    Some([p1, p2]) => {
+                        if p1 != p2 {
+                            bail!("asymmetric output_padding for ConvTranspose2d is not supported yet")
+                        }
+                        *p1 as usize
+                    }
+                    _ => bail!("unsupported output_padding for ConvTranspose2d"),
+                };
+                let dilation = match dilations {
+                    None => 1,
+                    Some([d1, d2]) => {
+                        if d1 != d2 {
+                            bail!("asymmetric dilations for ConvTranspose2d is not supported yet")
+                        }
+                        *d1 as usize
+                    }
+                    _ => bail!("unsupported dilations for ConvTranspose2d"),
+                };
+
+                let mut ys = xs.conv_transpose2d(ws, stride, padding, out_padding, dilation)?;
+
+                if node.input.len() > 2 {
+                    let bias = get(&node.input[2])?;
+                    let b_dims = bias.dims();
+                    let target_shape: Vec<usize> = ys
+                        .dims()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, v)| if idx == 1 { *v } else { 1 })
+                        .collect();
+                    ys = ys.broadcast_add(&bias.reshape(target_shape)?)?;
+                }
+                values.insert(node.output[0].clone(), ys);
             }
             "ArgMin" => {
                 let input = get(&node.input[0])?;
@@ -2281,10 +2550,6 @@ fn simple_eval_(
             "Resize" => {
                 let input = get(&node.input[0])?;
 
-                if input.rank() != 4 {
-                    bail!("Unsupported rank for nearest resize: {}", input.rank());
-                }
-
                 let scales = if node.input.len() > 2 && !node.input[2].is_empty() {
                     Some(get(&node.input[2])?)
                 } else {
@@ -2331,20 +2596,29 @@ fn simple_eval_(
                     bail!("Unsupported resize mode: {}", mode);
                 }
 
-                if nearest_mode != "floor" {
+                if nearest_mode != "floor" && nearest_mode != "round_prefer_floor" {
                     bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
                 }
 
-                if coordinate_transformation_mode != "asymmetric" {
+                if coordinate_transformation_mode != "asymmetric" && coordinate_transformation_mode != "half_pixel" {
                     bail!(
                         "Unsupported coordinate_transformation_mode for resize: {}",
                         coordinate_transformation_mode
                     );
                 }
 
-                let h = output_dims[2];
-                let w = output_dims[3];
-                let output = input.upsample_nearest2d(h, w)?;
+                let output = match input.rank() {
+                    3 => {
+                        let l = output_dims[2];
+                        input.unsqueeze(2)?.upsample_nearest2d(1, l)?.squeeze(2)?
+                    }
+                    4 => {
+                        let h = output_dims[2];
+                        let w = output_dims[3];
+                        input.upsample_nearest2d(h, w)?
+                    }
+                    rank => bail!("Unsupported rank for nearest resize: {}", rank),
+                };
 
                 values.insert(node.output[0].clone(), output);
             }
