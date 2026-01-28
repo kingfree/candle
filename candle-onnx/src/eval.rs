@@ -251,8 +251,17 @@ fn simple_eval_(
     graph: &onnx::GraphProto,
     values: &mut HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>> {
+    // Detect target device from inputs (defaults to CPU if empty or all CPU)
+    let device = values.values().next().map(|t| t.device().clone()).unwrap_or(Device::Cpu);
+
     for t in graph.initializer.iter() {
         let tensor = get_tensor(t, t.name.as_str())?;
+        // Move initializer to target device if needed
+        let tensor = if !tensor.device().same_device(&device) {
+            tensor.to_device(&device)?
+        } else {
+            tensor
+        };
         values.insert(t.name.to_string(), tensor);
     }
     for input in graph.input.iter() {
@@ -336,18 +345,19 @@ fn simple_eval_(
 
     // The nodes are topologically sorted so we can just process them in order.
     for node in graph.node.iter() {
-        let get = |input_name: &str| match values.get(input_name) {
-            Some(value) => Ok(value),
-            None => bail!("cannot find {input_name} for op '{}'", node.name),
+        let get = |input_name: &str| {
+            values.get(input_name).ok_or_else(|| {
+                candle::Error::Msg(format!("node {}: input '{input_name}' not found", node.name))
+            })
         };
-        let get_opt = |i: usize| {
-            node.input
-                .get(i)
-                .filter(|s: &&String| !s.is_empty())
-                .map(|s| get(s))
+        let get_opt = |index: usize| {
+            if index >= node.input.len() || node.input[index].is_empty() {
+                None
+            } else {
+                Some(get(&node.input[index]))
+            }
         };
 
-        // TODO: Validate node.input for each operator.
         match node.op_type.as_str() {
             "Add" => {
                 let input0 = get(&node.input[0])?;
@@ -741,6 +751,11 @@ fn simple_eval_(
                     DType::F32,
                     &Device::Cpu,
                 )?);
+                let value = if !value.device().same_device(input.device()) {
+                    value.to_device(input.device())?
+                } else {
+                    value
+                };
 
                 let shape_vec: Vec<usize> = to_vec1_flexible::<i64>(input)?
                     .iter()
@@ -812,19 +827,26 @@ fn simple_eval_(
                         .add(indices)?
                 };
 
+                // Workaround for missing is_i64_i64 kernel on Metal
+                let (xs_workaround, cast_back) = if xs.dtype() == DType::I64 && xs.device().is_metal() {
+                    (xs.to_dtype(DType::F32)?, true)
+                } else {
+                    (xs.clone(), false)
+                };
+
                 // In Pytorch or Numpy this can be done by indexing the xs tensor using the indices
                 // tensor directly, but candle does not support tensor indexing at the moment, so
                 // some workarounds must be done.
-                let xs = match indices.dims() {
+                let mut xs = match indices.dims() {
                     [] => {
                         let index = indices.to_vec0::<i64>()? as usize;
-                        xs.narrow(axis, index, 1)?.squeeze(axis)?
+                        xs_workaround.narrow(axis, index, 1)?.squeeze(axis)?
                     }
-                    [_] => xs.index_select(indices, axis)?,
+                    [_] => xs_workaround.index_select(indices, axis)?,
                     [first, _] => {
                         let mut v = Vec::with_capacity(*first);
                         for i in 0..*first {
-                            v.push(xs.index_select(&indices.get(i)?, axis)?)
+                            v.push(xs_workaround.index_select(&indices.get(i)?, axis)?)
                         }
                         Tensor::stack(&v, axis)?
                     }
@@ -834,6 +856,10 @@ fn simple_eval_(
                         todo!("implement gather for {xs:?} {indices:?} axis {axis}")
                     }
                 };
+
+                if cast_back {
+                    xs = xs.to_dtype(DType::I64)?;
+                }
                 values.insert(node.output[0].clone(), xs);
             }
             // https://onnx.ai/onnx/operators/onnx__GatherElements.html#gatherelements
@@ -1862,11 +1888,11 @@ fn simple_eval_(
                 let output = if random_type == "RandomUniform" {
                     let low: f32 = get_attr_opt(node, "low")?.copied().unwrap_or(0.0);
                     let high: f32 = get_attr_opt(node, "high")?.copied().unwrap_or(1.0);
-                    Tensor::rand(low, high, shape, &Device::Cpu)?.to_dtype(dtype)?
+                    Tensor::rand(low, high, shape, &device)?.to_dtype(dtype)?
                 } else {
                     let mean: f32 = get_attr_opt(node, "mean")?.copied().unwrap_or(0.0);
                     let scale: f32 = get_attr_opt(node, "scale")?.copied().unwrap_or(1.0);
-                    Tensor::randn(mean, scale, shape, &Device::Cpu)?.to_dtype(dtype)?
+                    Tensor::randn(mean, scale, shape, &device)?.to_dtype(dtype)?
                 };
                 values.insert(node.output[0].clone(), output);
             }
@@ -1920,60 +1946,95 @@ fn simple_eval_(
                 let strides = get_attr_opt::<[i64]>(node, "strides")?;
                 let output_padding = get_attr_opt::<[i64]>(node, "output_padding")?;
                 let dilations = get_attr_opt::<[i64]>(node, "dilations")?;
-                let _groups = get_attr_opt::<i64>(node, "group")?.copied().unwrap_or(1);
+                let groups = get_attr_opt::<i64>(node, "group")?.copied().unwrap_or(1) as usize;
 
-                let padding = match pads {
-                    None => 0,
-                    Some([p1, p2, p3, p4]) => {
-                        if p1 != p2 || p1 != p3 || p1 != p4 {
-                            bail!("asymmetric padding for ConvTranspose2d is not supported yet")
-                        }
-                        *p1 as usize
+                let mut ys = match xs.rank() {
+                    3 => {
+                        let padding = match pads {
+                            None => 0,
+                            Some([p]) => *p as usize,
+                            Some([p1, p2]) => {
+                                if p1 != p2 {
+                                    bail!("asymmetric padding for ConvTranspose1d is not supported yet")
+                                }
+                                *p1 as usize
+                            }
+                            _ => bail!("unsupported pads for ConvTranspose1d: {:?}", pads),
+                        };
+                        let stride = match strides {
+                            None => 1,
+                            Some([s]) => *s as usize,
+                            _ => bail!("unsupported strides for ConvTranspose1d: {:?}", strides),
+                        };
+                        let out_padding = match output_padding {
+                            None => 0,
+                            Some([p]) => *p as usize,
+                            _ => bail!("unsupported output_padding for ConvTranspose1d: {:?}", output_padding),
+                        };
+                        let dilation = match dilations {
+                            None => 1,
+                            Some([d]) => *d as usize,
+                            _ => bail!("unsupported dilations for ConvTranspose1d: {:?}", dilations),
+                        };
+                        xs.conv_transpose1d(ws, padding, out_padding, stride, dilation, groups)?
                     }
-                    Some([p1, p2]) => {
-                        if p1 != p2 {
-                            bail!("asymmetric padding for ConvTranspose2d is not supported yet")
+                    4 => {
+                        let padding = match pads {
+                            None => 0,
+                            Some([p1, p2, p3, p4]) => {
+                                if p1 != p2 || p1 != p3 || p1 != p4 {
+                                    bail!("asymmetric padding for ConvTranspose2d is not supported yet")
+                                }
+                                *p1 as usize
+                            }
+                            Some([p1, p2]) => {
+                                if p1 != p2 {
+                                    bail!("asymmetric padding for ConvTranspose2d is not supported yet")
+                                }
+                                *p1 as usize
+                            }
+                            _ => bail!("unsupported pads for ConvTranspose2d"),
+                        };
+                        let stride = match strides {
+                            None => 1,
+                            Some([s1, s2]) => {
+                                if s1 != s2 {
+                                    bail!("asymmetric strides for ConvTranspose2d is not supported yet")
+                                }
+                                *s1 as usize
+                            }
+                            _ => bail!("unsupported strides for ConvTranspose2d"),
+                        };
+                        let out_padding = match output_padding {
+                            None => 0,
+                            Some([p1, p2]) => {
+                                if p1 != p2 {
+                                    bail!("asymmetric output_padding for ConvTranspose2d is not supported yet")
+                                }
+                                *p1 as usize
+                            }
+                            _ => bail!("unsupported output_padding for ConvTranspose2d"),
+                        };
+                        let dilation = match dilations {
+                            None => 1,
+                            Some([d1, d2]) => {
+                                if d1 != d2 {
+                                    bail!("asymmetric dilations for ConvTranspose2d is not supported yet")
+                                }
+                                *d1 as usize
+                            }
+                            _ => bail!("unsupported dilations for ConvTranspose2d"),
+                        };
+                        if groups != 1 {
+                             bail!("groups > 1 for ConvTranspose2d is not supported yet in candle")
                         }
-                        *p1 as usize
+                        xs.conv_transpose2d(ws, padding, out_padding, stride, dilation)?
                     }
-                    _ => bail!("unsupported pads for ConvTranspose2d"),
+                    r => bail!("unsupported rank {r} for ConvTranspose"),
                 };
-                let stride = match strides {
-                    None => 1,
-                    Some([s1, s2]) => {
-                        if s1 != s2 {
-                            bail!("asymmetric strides for ConvTranspose2d is not supported yet")
-                        }
-                        *s1 as usize
-                    }
-                    _ => bail!("unsupported strides for ConvTranspose2d"),
-                };
-                let out_padding = match output_padding {
-                    None => 0,
-                    Some([p1, p2]) => {
-                        if p1 != p2 {
-                            bail!("asymmetric output_padding for ConvTranspose2d is not supported yet")
-                        }
-                        *p1 as usize
-                    }
-                    _ => bail!("unsupported output_padding for ConvTranspose2d"),
-                };
-                let dilation = match dilations {
-                    None => 1,
-                    Some([d1, d2]) => {
-                        if d1 != d2 {
-                            bail!("asymmetric dilations for ConvTranspose2d is not supported yet")
-                        }
-                        *d1 as usize
-                    }
-                    _ => bail!("unsupported dilations for ConvTranspose2d"),
-                };
-
-                let mut ys = xs.conv_transpose2d(ws, stride, padding, out_padding, dilation)?;
 
                 if node.input.len() > 2 {
                     let bias = get(&node.input[2])?;
-                    let b_dims = bias.dims();
                     let target_shape: Vec<usize> = ys
                         .dims()
                         .iter()
@@ -2073,8 +2134,8 @@ fn simple_eval_(
                 let alpha = get_attr_opt::<f32>(node, "alpha")?.copied().unwrap_or(1.0);
                 let beta = get_attr_opt::<f32>(node, "beta")?.copied().unwrap_or(1.0);
 
-                let alpha = Tensor::full(alpha, a.shape(), &Device::Cpu)?;
-                let beta = Tensor::full(beta, c.shape(), &Device::Cpu)?;
+                let alpha = Tensor::full(alpha, a.shape(), a.device())?;
+                let beta = Tensor::full(beta, c.shape(), c.device())?;
 
                 let trans_a = get_attr_opt::<i64>(node, "transA")?.copied().unwrap_or(0);
                 let trans_b = get_attr_opt::<i64>(node, "transB")?.copied().unwrap_or(0);

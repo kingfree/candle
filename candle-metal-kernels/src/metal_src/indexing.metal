@@ -261,6 +261,7 @@ kernel void NAME( \
 
 INDEX_OP(is_i64_f32, int64_t, float)
 INDEX_OP(is_i64_f16, int64_t, half)
+INDEX_OP(is_i64_i64, int64_t, int64_t)
 #if defined(__HAVE_BFLOAT__)
 INDEX_OP(is_i64_bf16, int64_t, bfloat)
 #endif
