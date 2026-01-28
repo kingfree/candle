@@ -286,6 +286,8 @@ fn simple_eval_(
             None => continue,
             Some(shape) => {
                 if shape.dim.len() != tensor.rank() {
+                    eprintln!("Rank mismatch for input '{}': expected rank {} (shape {:?}), got rank {} (shape {:?})",
+                        input.name, shape.dim.len(), shape.dim, tensor.rank(), tensor.shape());
                     bail!(
                         "unexpected rank for {}, got {:?}, expected {:?}",
                         input.name,
@@ -319,6 +321,19 @@ fn simple_eval_(
             )
         }
     }
+    // Build reference counts: how many times each value name is used as input.
+    // When a value's refcount drops to zero after a node processes it, we can free it.
+    let output_names: std::collections::HashSet<&str> =
+        graph.output.iter().map(|o| o.name.as_str()).collect();
+    let mut refcounts: HashMap<String, usize> = HashMap::new();
+    for node in graph.node.iter() {
+        for input_name in node.input.iter() {
+            if !input_name.is_empty() {
+                *refcounts.entry(input_name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
     // The nodes are topologically sorted so we can just process them in order.
     for node in graph.node.iter() {
         let get = |input_name: &str| match values.get(input_name) {
@@ -395,7 +410,7 @@ fn simple_eval_(
             }
             "Reshape" => {
                 let input0 = get(&node.input[0])?;
-                let input1 = get(&node.input[1])?.to_vec1::<i64>()?;
+                let input1 = to_vec1_flexible::<i64>(get(&node.input[1])?)?;
                 // TODO: Check that there is at most a single -1 or 0, handle other neg values.
                 let mut other_than_minus1 = 1usize;
                 for &v in input1.iter() {
@@ -706,8 +721,7 @@ fn simple_eval_(
                         .flat_map(|(idx, &s)| if s == 1 && idx > 0 { Some(idx) } else { None })
                         .collect()
                 } else {
-                    get(&node.input[1])?
-                        .to_vec1::<i64>()?
+                    to_vec1_flexible::<i64>(get(&node.input[1])?)?
                         .iter()
                         .map(|&i| xs.normalize_axis(i))
                         .collect::<Result<Vec<_>>>()?
@@ -728,8 +742,7 @@ fn simple_eval_(
                     &Device::Cpu,
                 )?);
 
-                let shape_vec: Vec<usize> = input
-                    .to_vec1::<i64>()?
+                let shape_vec: Vec<usize> = to_vec1_flexible::<i64>(input)?
                     .iter()
                     .map(|&x| x as usize)
                     .collect();
@@ -2759,7 +2772,7 @@ fn simple_eval_(
                 // Process each update
                 for i in 0..num_updates {
                     let index_slice = flat_indices.narrow(0, i, 1)?;
-                    let indices_vec = index_slice.squeeze(0)?.to_vec1::<i64>()?;
+                    let indices_vec = to_vec1_flexible::<i64>(&index_slice.squeeze(0)?)?;
 
                     // Convert multi-dimensional indices to flat index
                     let mut flat_idx: usize = 0;
@@ -2783,7 +2796,7 @@ fn simple_eval_(
                     let update_slice = if update_element_shape.is_empty() {
                         flat_updates.narrow(0, i, 1)?.squeeze(0)?
                     } else {
-                        flat_updates.narrow(0, i, 1)?
+                        flat_updates.narrow(0, i, 1)?.squeeze(0)?
                     };
 
                     match reduction {
@@ -2820,6 +2833,18 @@ fn simple_eval_(
                 values.insert(node.output[0].clone(), output);
             }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
+        }
+        // Decrement refcounts for inputs and free values no longer needed
+        for input_name in node.input.iter() {
+            if input_name.is_empty() {
+                continue;
+            }
+            if let Some(rc) = refcounts.get_mut(input_name) {
+                *rc -= 1;
+                if *rc == 0 && !output_names.contains(input_name.as_str()) {
+                    values.remove(input_name);
+                }
+            }
         }
     }
     graph
@@ -2882,5 +2907,15 @@ fn to_vec0_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
         t.flatten_all()?.i(0)?.to_vec0::<T>()
     } else {
         t.to_vec0::<T>()
+    }
+}
+
+/// Same as to_scalar_flexible but returns via to_vec1 for types that need it.
+/// Handles rank-2 tensors like [1, k] by flattening them.
+fn to_vec1_flexible<T: candle::WithDType>(t: &Tensor) -> Result<Vec<T>> {
+    if t.rank() != 1 && t.elem_count() > 0 {
+        t.flatten_all()?.to_vec1::<T>()
+    } else {
+        t.to_vec1::<T>()
     }
 }
